@@ -106,15 +106,17 @@ export function ModelStep({
   const { language } = useSettings();
   const route = RECOMMENDED_ROUTES[language];
   const recommendedValue = JSON.stringify([route.provider, route.model]);
-  const task = useTask();
-  const confirmation = useTask();
+  const [mode, setMode] = useState<Mode>("recommended");
+  const [selection, setSelection] = useState<{ epoch: number; identity: string }>();
+  const [model, setModel] = useState("");
+  // A failed probe belongs to the selection that produced it.
+  const taskScope = JSON.stringify([route.provider, mode, selection?.identity, model]);
+  const task = useTask(taskScope);
+  const confirmation = useTask(taskScope);
   const directory = useModelDirectory();
   const { epoch, data: current, loading, failed, ollama, detecting, refresh, detect } = directory;
   const busy = task.busy || confirmation.busy;
   const isBusy = () => task.isBusy() || confirmation.isBusy();
-  const [mode, setMode] = useState<Mode>("recommended");
-  const [selection, setSelection] = useState<{ epoch: number; identity: string }>();
-  const [model, setModel] = useState("");
   const [dirty, setDirty] = useState(false);
   const [pending, setPending] = useState<{ action(): void }>();
   const [localModel, setLocalModel] = useState("");
