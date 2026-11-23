@@ -179,17 +179,32 @@ export function extractionSource(
   const oversized = groupId
     ? []
     : messages.filter((message) => message.role === "user" && message.cost > budget);
-  // Reserve a small excerpt per oversized message before filling the rest with whole turns.
-  const reserve = oversized.length
-    ? Math.min(OVERSIZED_USER_EXCERPT_RESERVE, Math.floor(budget / oversized.length))
-    : 0;
-  const wholeUserBudget = budget - reserve * oversized.length;
   const selected = new Map<string, string>();
   const contents = new Map<string, string>();
   let used = 0;
   let truncated = rows.length === 256;
   for (const role of ["user", "assistant"]) {
-    if (role === "assistant") {
+    if (role === "assistant" && oversized.length) {
+      // Select whole user turns first, then make room by shortening the largest selected turns.
+      // This keeps an almost-full turn from crowding out smaller turns during reservation.
+      const reserve = Math.min(
+        OVERSIZED_USER_EXCERPT_RESERVE,
+        Math.floor(budget / (selected.size + oversized.length)),
+      );
+      const wholeUserBudget = budget - reserve * oversized.length;
+      if (used > wholeUserBudget) {
+        const largestFirst = messages
+          .filter((message) => selected.has(message.id))
+          .sort((a, b) => b.cost - a.cost);
+        for (const message of largestFirst) {
+          if (used <= wholeUserBudget || message.cost <= reserve) break;
+          const cap = Math.max(reserve, message.cost - (used - wholeUserBudget));
+          const excerpt = userExcerpt(message.content, cap);
+          if (!excerpt) continue;
+          selected.set(message.id, excerpt);
+          used += estimateTokens(excerpt) + 4 - message.cost;
+        }
+      }
       for (const [index, message] of oversized.entries()) {
         const share = Math.floor((budget - used) / (oversized.length - index));
         const excerpt = userExcerpt(message.content, share);
@@ -199,22 +214,15 @@ export function extractionSource(
         }
       }
     }
-    const limit = role === "user" ? wholeUserBudget : budget;
     for (const message of messages) {
       if (message.role !== role) continue;
-      let { line, cost } = message;
-      if (used + cost > limit) {
+      if (used + message.cost > budget) {
         truncated = true;
-        // A whole user turn that only lost room to the reserve can still contribute.
-        if (role !== "user" || used + cost > budget) continue;
-        const excerpt = userExcerpt(message.content, limit - used);
-        if (!excerpt) continue;
-        line = excerpt;
-        cost = estimateTokens(line) + 4;
+        continue;
       }
-      selected.set(message.id, line);
+      selected.set(message.id, message.line);
       contents.set(message.id, message.content);
-      used += cost;
+      used += message.cost;
     }
   }
   const subject = rows.find((row) => row.role === "user" && selected.has(String(row.id)));

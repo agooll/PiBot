@@ -140,3 +140,35 @@ it("keeps only whole eligible statements as group evidence", () => {
     db.close();
   }
 }, 30_000);
+
+it("keeps a short earlier turn when an almost-full turn precedes the excerpt allocation", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    runMigrations(db);
+    const bot = new BotsRepo(db).ensureMainBot();
+    const conversation = new ConversationsRepo(db).create({ botId: bot.id });
+    const messages = new MessagesRepo(db);
+    const send = (content: string) =>
+      messages.create({ conversationId: conversation.id, role: "user", status: "done", content });
+
+    send("My timezone is UTC.");
+    send(`Earlier decision ${"L".repeat(60_000)}`);
+    const latest = `Latest decision ${"A".repeat((11_968 - 4) * 4 - "User: Latest decision ".length)}`;
+    expect(estimatedCost([`User: ${latest}`])).toBe(11_968);
+    const tail = send(latest);
+
+    const source = extractionSource(db, conversation.id, null);
+    const lines = source?.text.split("\n\n") ?? [];
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toBe("User: My timezone is UTC.");
+    expect(lines[1]).toMatch(/^User: Earlier decision L+\n\[message truncated\]$/u);
+    expect(lines[2]).toMatch(/^User: Latest decision A+\n\[message truncated\]$/u);
+    expect(estimatedCost(lines)).toBeLessThanOrEqual(12_000);
+    expect(source?.watermarkId).toBe(tail.id);
+
+    send("Later");
+    expect(extractionSource(db, conversation.id, tail.id)?.text).toBe("User: Later");
+  } finally {
+    db.close();
+  }
+}, 30_000);
