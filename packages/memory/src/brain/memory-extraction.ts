@@ -9,11 +9,28 @@ import { memoryHumanMessageSql } from "@pibot/storage";
 import { z } from "zod";
 import type { MemoryToolInput } from "./memory-input.ts";
 
+function tokenUnits(point: string): number {
+  return (point.codePointAt(0) ?? 0) > 127 ? point.length * 4 : 1;
+}
+
 /** Rough token estimate for the input budget; the provider's own count is not available yet. */
 function estimateTokens(text: string): number {
-  let nonAscii = 0;
-  for (const point of text) if ((point.codePointAt(0) ?? 0) > 127) nonAscii += point.length;
-  return Math.ceil((text.length - nonAscii) / 4 + nonAscii);
+  let units = 0;
+  for (const point of text) units += tokenUnits(point);
+  return Math.ceil(units / 4);
+}
+
+function oversizedUserExcerpt(content: string, budget: number): string | undefined {
+  const speaker = "User: ";
+  const marker = "\n[message truncated]";
+  let remaining = (budget - estimateTokens(speaker + marker) - 4) * 4;
+  let end = 0;
+  for (const point of content) {
+    remaining -= tokenUnits(point);
+    if (remaining < 0) break;
+    end += point.length;
+  }
+  if (end > 0) return speaker + content.slice(0, end) + marker;
 }
 
 /** The only shape the extraction model's output may take. */
@@ -142,13 +159,20 @@ export function extractionSource(
       ORDER BY m.rowid DESC LIMIT 256`,
     )
     .all(conversationId, Number(after), groupId ?? null, groupId ?? null);
-  // Allocate to human messages first, then bounded assistant summaries. Never split a user turn.
+  // Give whole human messages priority, then an excerpt if a turn could never fit on its own.
   const selected = new Map<string, string>();
   const contents = new Map<string, string>();
   let used = 0;
   let truncated = rows.length === 256;
-  let subjectMessageId: string | undefined;
-  for (const role of ["user", "assistant"])
+  let oversizedUser: { id: string; content: string } | undefined;
+  for (const role of ["user", "assistant"]) {
+    if (role === "assistant" && oversizedUser) {
+      const excerpt = oversizedUserExcerpt(oversizedUser.content, budget - used);
+      if (excerpt) {
+        selected.set(oversizedUser.id, excerpt);
+        used += estimateTokens(excerpt) + 4;
+      }
+    }
     for (const row of rows) {
       if (row.role !== role) continue;
       const clean = String(row.content ?? "")
@@ -167,16 +191,24 @@ export function extractionSource(
       const cost = estimateTokens(line) + 4;
       if (used + cost > budget) {
         truncated = true;
+        // Group extraction verifies candidates against a complete source statement.
+        if (role === "user" && !groupId && cost > budget)
+          oversizedUser ??= { id: String(row.id), content };
         continue;
       }
       selected.set(String(row.id), line);
       contents.set(String(row.id), content);
       used += cost;
-      if (role === "user" && !subjectMessageId) subjectMessageId = String(row.id);
     }
+  }
+  const subject = rows.find((row) => row.role === "user" && selected.has(String(row.id)));
   // A later coordinator confirmation can be the only new statement after the last watermark.
-  if (groupId && !subjectMessageId) subjectMessageId = selected.keys().next().value;
-  if (!selected.size || !subjectMessageId) return undefined;
+  const subjectMessageId = subject
+    ? String(subject.id)
+    : groupId
+      ? selected.keys().next().value
+      : undefined;
+  if (!subjectMessageId) return undefined;
   return {
     text: [...rows]
       .reverse()
@@ -254,7 +286,7 @@ export function extractionPrompt(catalog: string, source: string, truncated: boo
     "EXISTING MEMORIES:",
     catalog || "(none)",
     "",
-    truncated ? "NEW CONVERSATION (older messages omitted):" : "NEW CONVERSATION:",
+    truncated ? "NEW CONVERSATION (some content omitted):" : "NEW CONVERSATION:",
     "<<<",
     source,
     ">>>",
