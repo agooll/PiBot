@@ -20,7 +20,9 @@ function estimateTokens(text: string): number {
   return Math.ceil(units / 4);
 }
 
-function oversizedUserExcerpt(content: string, budget: number): string | undefined {
+const OVERSIZED_USER_EXCERPT_RESERVE = 32;
+
+function userExcerpt(content: string, budget: number): string | undefined {
   const speaker = "User: ";
   const marker = "\n[message truncated]";
   let remaining = (budget - estimateTokens(speaker + marker) - 4) * 4;
@@ -159,45 +161,59 @@ export function extractionSource(
       ORDER BY m.rowid DESC LIMIT 256`,
     )
     .all(conversationId, Number(after), groupId ?? null, groupId ?? null);
-  // Give whole human messages priority, then an excerpt if a turn could never fit on its own.
+  const messages = rows.flatMap((row) => {
+    const clean = String(row.content ?? "")
+      .replace(/```[\s\S]*?(?:```|$)/g, "[code omitted]")
+      .trim();
+    const content = row.role === "user" || groupId ? clean : assistantSummary(clean);
+    if (!content) return [];
+    const speaker = groupId
+      ? `${row.role === "user" ? "Owner" : "Coordinator"} [${row.id}]`
+      : row.role === "user"
+        ? "User"
+        : "Assistant";
+    const line = `${speaker}: ${content}`;
+    return [{ id: String(row.id), role: row.role, content, line, cost: estimateTokens(line) + 4 }];
+  });
+  // Group extraction verifies candidates against complete source statements.
+  const oversized = groupId
+    ? []
+    : messages.filter((message) => message.role === "user" && message.cost > budget);
+  // Reserve a small excerpt per oversized message before filling the rest with whole turns.
+  const reserve = oversized.length
+    ? Math.min(OVERSIZED_USER_EXCERPT_RESERVE, Math.floor(budget / oversized.length))
+    : 0;
+  const wholeUserBudget = budget - reserve * oversized.length;
   const selected = new Map<string, string>();
   const contents = new Map<string, string>();
   let used = 0;
   let truncated = rows.length === 256;
-  let oversizedUser: { id: string; content: string } | undefined;
   for (const role of ["user", "assistant"]) {
-    if (role === "assistant" && oversizedUser) {
-      const excerpt = oversizedUserExcerpt(oversizedUser.content, budget - used);
-      if (excerpt) {
-        selected.set(oversizedUser.id, excerpt);
-        used += estimateTokens(excerpt) + 4;
+    if (role === "assistant") {
+      for (const [index, message] of oversized.entries()) {
+        const share = Math.floor((budget - used) / (oversized.length - index));
+        const excerpt = userExcerpt(message.content, share);
+        if (excerpt) {
+          selected.set(message.id, excerpt);
+          used += estimateTokens(excerpt) + 4;
+        }
       }
     }
-    for (const row of rows) {
-      if (row.role !== role) continue;
-      const clean = String(row.content ?? "")
-        .replace(/```[\s\S]*?(?:```|$)/g, "[code omitted]")
-        .trim();
-      // A group decision may occur after the first 400 characters; keep the whole authorized
-      // statement or omit it under the existing budget, never import member work as consensus.
-      const content = role === "user" || groupId ? clean : assistantSummary(clean);
-      if (!content) continue;
-      const speaker = groupId
-        ? `${role === "user" ? "Owner" : "Coordinator"} [${row.id}]`
-        : role === "user"
-          ? "User"
-          : "Assistant";
-      const line = `${speaker}: ${content}`;
-      const cost = estimateTokens(line) + 4;
-      if (used + cost > budget) {
+    const limit = role === "user" ? wholeUserBudget : budget;
+    for (const message of messages) {
+      if (message.role !== role) continue;
+      let { line, cost } = message;
+      if (used + cost > limit) {
         truncated = true;
-        // Group extraction verifies candidates against a complete source statement.
-        if (role === "user" && !groupId && cost > budget)
-          oversizedUser ??= { id: String(row.id), content };
-        continue;
+        // A whole user turn that only lost room to the reserve can still contribute.
+        if (role !== "user" || used + cost > budget) continue;
+        const excerpt = userExcerpt(message.content, limit - used);
+        if (!excerpt) continue;
+        line = excerpt;
+        cost = estimateTokens(line) + 4;
       }
-      selected.set(String(row.id), line);
-      contents.set(String(row.id), content);
+      selected.set(message.id, line);
+      contents.set(message.id, message.content);
       used += cost;
     }
   }
@@ -210,9 +226,9 @@ export function extractionSource(
       : undefined;
   if (!subjectMessageId) return undefined;
   return {
-    text: [...rows]
+    text: messages
       .reverse()
-      .flatMap((row) => selected.get(String(row.id)) ?? [])
+      .flatMap((message) => selected.get(message.id) ?? [])
       .join("\n\n"),
     messageCount: selected.size,
     truncated,
