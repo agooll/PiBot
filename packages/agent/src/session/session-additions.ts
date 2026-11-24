@@ -88,21 +88,27 @@ export async function requeue(
   mode: "steer" | "followUp",
 ): Promise<boolean> {
   const cleared = session.clearQueue();
-  const left = { steer: [...cleared.steering], followUp: [...cleared.followUp] };
-  const back: Input[] = [];
-  let switched = false;
-  for (const [key, input] of additions.queued) {
-    const at = left[input.mode].indexOf(input.text);
-    if (at < 0) continue;
-    left[input.mode].splice(at, 1);
-    if (key === id) {
-      input.mode = mode;
-      switched = true;
+  const tracked = new Map(
+    [...additions.queued].map(([key, input]) => [`${input.mode}:${input.text}`, { key, input }]),
+  );
+  let moved: Input | undefined;
+  for (const [queue, texts] of [
+    ["steer", cleared.steering],
+    ["followUp", cleared.followUp],
+  ] as const) {
+    for (const text of texts) {
+      const lookup = `${queue}:${text}`;
+      const match = tracked.get(lookup);
+      tracked.delete(lookup);
+      if (match?.key === id) {
+        moved = match.input;
+        continue;
+      }
+      await session[queue](text, match?.input.images);
     }
-    back.push(input);
   }
-  for (const text of left.steer) await session.steer(text);
-  for (const text of left.followUp) await session.followUp(text);
-  for (const input of back) await session[input.mode](input.text, input.images);
-  return switched;
+  if (!moved) return false;
+  await session[mode](moved.text, moved.images);
+  moved.mode = mode;
+  return true;
 }
