@@ -12,19 +12,27 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return { ...actual, stat: vi.fn(actual.stat) };
 });
 
-it.each([0, 1])("cancels only caller %i while sharing one context estimate", async (cancelled) => {
+it.each(["first", "second"] as const)("cancels only the %s caller", async (cancelled) => {
   vi.clearAllMocks();
   const dir = await mkdtemp(join(tmpdir(), "pibot-context-estimate-"));
   const file = join(dir, "session.jsonl");
-  const ready = Promise.withResolvers<Awaited<ReturnType<RuntimeContext["buildRuntime"]>>>();
+  let release: (() => void) | undefined;
+  const ready = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   const open = vi.fn(() => ({ getBranch: () => [] }));
-  const buildRuntime = vi.fn(() => ready.promise);
   const runtime = {
     pi: { SessionManager: { open }, buildSessionProjection: () => ({ messages: [] }) },
   };
-  const controllers = [new AbortController(), new AbortController()];
+  const buildRuntime = vi.fn(async () => {
+    await ready;
+    return runtime;
+  });
+  const first = { controller: new AbortController(), failed: vi.fn() };
+  const second = { controller: new AbortController(), failed: vi.fn() };
+  const cancelledCaller = cancelled === "first" ? first : second;
+  const activeCaller = cancelled === "first" ? second : first;
   const reason = new Error("caller cancelled");
-  const settled = [vi.fn(), vi.fn()];
 
   try {
     await writeFile(file, "{}\n");
@@ -33,29 +41,33 @@ it.each([0, 1])("cancels only caller %i while sharing one context estimate", asy
       dataDir: dir,
       buildRuntime,
     } as unknown as RuntimeContext).estimateContext;
-    const start = (index: number) =>
-      estimate?.({
+    if (!estimate) throw new Error("Missing context estimator");
+    const start = (caller: typeof first) =>
+      estimate({
         botId: "bot",
         sessionFile: file,
-        signal: controllers[index].signal,
-      }).catch(settled[index]);
+        signal: caller.controller.signal,
+      }).catch(caller.failed);
 
-    const first = start(0);
+    const firstResult = start(first);
     await vi.waitFor(() => expect(buildRuntime).toHaveBeenCalledOnce());
-    const second = start(1);
+    const secondResult = start(second);
     await vi.waitFor(() => expect(stat).toHaveBeenCalledTimes(2));
     await Promise.all(vi.mocked(stat).mock.results.map((result) => result.value));
-    controllers[cancelled].abort(reason);
-    await vi.waitFor(() => expect(settled[cancelled]).toHaveBeenCalledWith(reason));
+    cancelledCaller.controller.abort(reason);
+    await vi.waitFor(() => expect(cancelledCaller.failed).toHaveBeenCalledWith(reason));
 
-    ready.resolve(runtime as unknown as Awaited<ReturnType<RuntimeContext["buildRuntime"]>>);
-    const results = await Promise.all([first, second]);
-    expect(results[1 - cancelled]).toEqual({ tokens: 0, model: undefined });
-    expect(settled[1 - cancelled]).not.toHaveBeenCalled();
+    release?.();
+    const [firstEstimate, secondEstimate] = await Promise.all([firstResult, secondResult]);
+    expect(cancelled === "first" ? secondEstimate : firstEstimate).toEqual({
+      tokens: 0,
+      model: undefined,
+    });
+    expect(activeCaller.failed).not.toHaveBeenCalled();
     expect(buildRuntime).toHaveBeenCalledOnce();
     expect(open).toHaveBeenCalledOnce();
   } finally {
-    ready.resolve(runtime as unknown as Awaited<ReturnType<RuntimeContext["buildRuntime"]>>);
+    release?.();
     await rm(dir, { recursive: true, force: true });
   }
 });
