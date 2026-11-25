@@ -29,3 +29,32 @@ it("keeps the SDK delivery order when moving one queued input", async () => {
   expect(sdk.followUp.mock.calls.map(([text]) => text)).toEqual(["stay", "sdk follow-up"]);
   expect(additions.queued.get("moved")?.mode).toBe("steer");
 });
+
+it("matches duplicate queued text in order and keeps each input's images", async () => {
+  const additions = new SessionAdditions();
+  const firstImages: ImageContent[] = [{ type: "image", data: "AA==", mimeType: "image/png" }];
+  const secondImages: ImageContent[] = [{ type: "image", data: "AQ==", mimeType: "image/png" }];
+  additions.queued.set("first", { text: "continue", mode: "steer", images: firstImages });
+  additions.queued.set("second", { text: "continue", mode: "steer", images: secondImages });
+  const sdk = {
+    clearQueue: vi.fn(() => ({
+      steering: ["continue", "other", "continue", "continue"],
+      followUp: ["continue"],
+    })),
+    steer: vi.fn(async (_text: string, _images?: ImageContent[]) => undefined),
+    followUp: vi.fn(async (_text: string, _images?: ImageContent[]) => undefined),
+  };
+
+  expect(await requeue(additions, sdk, "first", "followUp")).toBe(true);
+  expect(sdk.steer.mock.calls).toEqual([
+    ["other", undefined],
+    ["continue", secondImages],
+    ["continue", undefined],
+  ]);
+  expect(sdk.followUp.mock.calls).toEqual([
+    ["continue", undefined],
+    ["continue", firstImages],
+  ]);
+  expect(additions.queued.get("first")?.mode).toBe("followUp");
+  expect(additions.queued.get("second")?.mode).toBe("steer");
+});

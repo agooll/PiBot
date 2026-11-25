@@ -77,9 +77,10 @@ type Queue = {
 /**
  * Switches queued input `id` between "add to the current task" and "after the current task". pi
  * keeps no per-item removal, so its queue is taken out and put back in order: only inputs still in
- * it go back; one pi already took (in flight, not yet announced) is in neither list, is not added
- * twice, and switching it reports false. Anything pi held that is not matched (another source, or
- * text a skill command expanded) goes back to its own queue unchanged.
+ * it go back, and the switched input joins the end of its destination queue. One pi already took
+ * (in flight, not yet announced) is in neither list, is not added twice, and switching it reports
+ * false. Anything pi held that is not matched (another source, or text a skill command expanded)
+ * goes back to its own queue unchanged.
  */
 export async function requeue(
   additions: SessionAdditions,
@@ -88,18 +89,20 @@ export async function requeue(
   mode: "steer" | "followUp",
 ): Promise<boolean> {
   const cleared = session.clearQueue();
-  const tracked = new Map(
-    [...additions.queued].map(([key, input]) => [`${input.mode}:${input.text}`, { key, input }]),
-  );
+  const tracked = new Map<string, { key: string; input: Input }[]>();
+  for (const [key, input] of additions.queued) {
+    const lookup = `${input.mode}:${input.text}`;
+    const matches = tracked.get(lookup);
+    if (matches) matches.push({ key, input });
+    else tracked.set(lookup, [{ key, input }]);
+  }
   let moved: Input | undefined;
   for (const [queue, texts] of [
     ["steer", cleared.steering],
     ["followUp", cleared.followUp],
   ] as const) {
     for (const text of texts) {
-      const lookup = `${queue}:${text}`;
-      const match = tracked.get(lookup);
-      tracked.delete(lookup);
+      const match = tracked.get(`${queue}:${text}`)?.shift();
       if (match?.key === id) {
         moved = match.input;
         continue;
